@@ -1,57 +1,102 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
+import asyncio
+import urllib.parse
+import urllib.request
+import json
 
 app = FastAPI()
 
-# --------------------------------
-# 🔓 CORS PARA TODOS LOS DOMINIOS
-# --------------------------------
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     # permitir cualquier dominio
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------
+# 🔥 Función síncrona (bloqueante) sin librerías externas
+# ---------------------------------------------------
+def request_sync(url, metodo, params):
+    try:
+        if metodo.lower() == "get":
+            # Construir URL con parámetros
+            url_completa = url + "?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url_completa)
+        else:
+            # POST con form-data nativo
+            data = urllib.parse.urlencode(params).encode()
+            req = urllib.request.Request(url, data=data)
+
+        # Hacer request
+        with urllib.request.urlopen(req, timeout=20) as res:
+            contenido = res.read().decode("utf-8")
+
+            # Intentar JSON
+            try:
+                contenido = json.loads(contenido)
+            except:
+                pass
+
+            return {
+                "ok": True,
+                "url": url,
+                "status": res.status,
+                "body": contenido
+            }
+
+    except Exception as e:
+        return {"ok": False, "url": url, "error": str(e)}
+
+# ---------------------------------------------------
+# 🔥 Wrapper asíncrono (usa hilo para no bloquear FastAPI)
+# ---------------------------------------------------
+async def llamar_api(pr, dom, metodo, path, params):
+    url = f"https://{pr}.{dom}{path}"
+    return await asyncio.to_thread(request_sync, url, metodo, params)
+
+# ---------------------------------------------------
+# 🟡 PROXY PRINCIPAL MULTI API
+# ---------------------------------------------------
 @app.get("/api")
 async def proxy(request: Request):
-    params = dict(request.query_params)
+    q = dict(request.query_params)
 
-    # Extraer parámetros propios del proxy
-    pr = params.pop("pr", None)              # ejemplo: reniec
-    dom = params.pop("dom", None)            # ejemplo: skrifna.uk
-    metodo = params.pop("metodo", "get")     # GET o POST
-    path = params.pop("parametros", "")      # ejemplo: /buscar
+    # -------- API 1 --------
+    pr1 = q.pop("pr", None)
+    dom1 = q.pop("dom", None)
+    metodo1 = q.pop("metodo", "get")
+    path1 = q.pop("parametros", "")
 
-    if not pr or not dom:
-        return {"error": "Faltan parámetros 'pr' y 'dom'"}
+    if not pr1 or not dom1:
+        return {"error": "Faltan pr y dom para API 1"}
 
-    # Construcción de la URL destino
-    url = f"https://{pr}.{dom}{path}"
+    params_api1 = q.copy()
 
-    # Cliente HTTP asíncrono
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            if metodo.lower() == "get":
-                res = await client.get(url, params=params)
-            else:
-                res = await client.post(url, data=params)
+    # -------- API 2 --------
+    pr2 = q.pop("pr2", None)
+    dom2 = q.pop("dom2", None)
+    metodo2 = q.pop("metodo2", "get")
+    path2 = q.pop("parametros2", "")
 
-        except httpx.RequestError as e:
-            return {"error": f"Error al conectar con {url}", "detalle": str(e)}
+    params_api2 = q.copy()
 
-    # Intentar parsear JSON, si no, devolver texto crudo
-    try:
-        contenido = res.json()
-    except Exception:
-        contenido = res.text
+    tareas = [
+        llamar_api(pr1, dom1, metodo1, path1, params_api1)
+    ]
+
+    if pr2 and dom2:
+        tareas.append(llamar_api(pr2, dom2, metodo2, path2, params_api2))
+
+    respuestas = await asyncio.gather(*tareas)
+
+    if len(respuestas) == 1:
+        return {"ok": True, "api_1": respuestas[0]}
 
     return {
         "ok": True,
-        "url_destino": url,
-        "enviado": params,
-        "status_code": res.status_code,
-        "contenido": contenido
+        "api_1": respuestas[0],
+        "api_2": respuestas[1]
     }
